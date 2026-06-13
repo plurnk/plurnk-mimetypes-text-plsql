@@ -50,6 +50,16 @@ class TextPlsqlVisitor extends withExtractor(PlSqlParserVisitor) {
             const colName = sqlNameText(cn);
             if (colName) this.addSymbol("field", colName, ctx);
         }
+        // Foreign keys are cross-table dependencies: this table USES every
+        // table referenced by a FOREIGN KEY ... REFERENCES clause. The
+        // referenced table is a tableview_name under references_clause —
+        // distinct from this table's own table_name, so no self-reference.
+        for (const fk of findDescendants(ctx, "Foreign_key_clauseContext")) {
+            for (const tv of findDescendants(fk, "Tableview_nameContext")) {
+                const fkName = tableRefName(tv);
+                if (fkName) this.addRef("use", fkName, tv as never, { container: name });
+            }
+        }
         return null;
     };
 
@@ -57,6 +67,9 @@ class TextPlsqlVisitor extends withExtractor(PlSqlParserVisitor) {
         if (this.inBody) return null;
         const name = sqlNameText(ctx._v);
         if (name) this.addSymbol("class", name, ctx);
+        // A view USES every table its SELECT reads — the core SQL graph edge
+        // (view → source tables). container = the view being created.
+        if (name) this.refTableNames(ctx, name);
         return null;
     };
 
@@ -65,6 +78,12 @@ class TextPlsqlVisitor extends withExtractor(PlSqlParserVisitor) {
         const inm = ctx.index_name?.();
         const name = sqlNameText(inm);
         if (name) this.addSymbol("field", name, ctx);
+        // An index attaches to its ON table (the only tableview_name here).
+        if (name) {
+            const tv = findDescendants(ctx, "Tableview_nameContext")[0];
+            const onName = tableRefName(tv);
+            if (onName) this.addRef("use", onName, tv as never, { container: name });
+        }
         return null;
     };
 
@@ -73,6 +92,8 @@ class TextPlsqlVisitor extends withExtractor(PlSqlParserVisitor) {
         const tn = ctx.trigger_name?.();
         const name = sqlNameText(tn);
         if (name) this.addSymbol("method", name, ctx);
+        // A trigger references its ON table and every table its body touches.
+        if (name) this.refTableNames(ctx, name);
         return null;
     };
 
@@ -81,6 +102,9 @@ class TextPlsqlVisitor extends withExtractor(PlSqlParserVisitor) {
         const pn = ctx.procedure_name?.();
         const name = sqlNameText(pn);
         if (name) this.addSymbol("function", name, ctx);
+        // A procedure USES every table its body reads/writes — a real Oracle
+        // dependency edge (DML inside BEGIN...END).
+        if (name) this.refTableNames(ctx, name);
         return null;
     };
 
@@ -89,6 +113,8 @@ class TextPlsqlVisitor extends withExtractor(PlSqlParserVisitor) {
         const fn = ctx.function_name?.();
         const name = sqlNameText(fn);
         if (name) this.addSymbol("function", name, ctx);
+        // A function USES every table its body queries.
+        if (name) this.refTableNames(ctx, name);
         return null;
     };
 
@@ -137,6 +163,18 @@ class TextPlsqlVisitor extends withExtractor(PlSqlParserVisitor) {
         if (name) this.addSymbol("type", name, ctx);
         return null;
     };
+
+    // Emit a `use` ref for every tableview_name descendant under `ctx`, owned
+    // by the created object `container`. The created object's own name is a
+    // view_name/trigger_name/procedure_name (distinct contexts that are NOT
+    // tableview_name), so it never self-references; FK references are handled
+    // separately in visitCreate_table.
+    private refTableNames(ctx: unknown, container: string): void {
+        for (const tv of findDescendants(ctx, "Tableview_nameContext")) {
+            const tableName = tableRefName(tv);
+            if (tableName) this.addRef("use", tableName, tv as never, { container });
+        }
+    }
 }
 
 function sqlNameText(ctx: unknown): string | null {
@@ -144,6 +182,18 @@ function sqlNameText(ctx: unknown): string | null {
     const raw = (ctx as { getText?: () => string }).getText?.();
     if (!raw) return null;
     return unquoteSqlIdentifier(raw);
+}
+
+// tableview_name resolves to SCHEMA.TABLE (getText keeps the schema dot),
+// whereas a CREATE TABLE def's table_name resolves to the bare identifier.
+// Strip to the last dotted segment so refs join against local table defs.
+function tableRefName(ctx: unknown): string | null {
+    if (!ctx) return null;
+    const raw = (ctx as { getText?: () => string }).getText?.();
+    if (!raw) return null;
+    const dot = raw.lastIndexOf(".");
+    const segment = dot >= 0 ? raw.slice(dot + 1) : raw;
+    return unquoteSqlIdentifier(segment);
 }
 
 function unquoteSqlIdentifier(s: string): string {
